@@ -54,7 +54,7 @@ type bucketSplitFallbackInfo struct {
 
 // String renders the split-fallback info for structured logs.
 func (info *bucketSplitFallbackInfo) String() string {
-	return fmt.Sprintf("bucketSplitFallback{reason=%s, remaining=%d}", info.reason, info.remainingRangeCount)
+	return fmt.Sprintf("bucketSplitFallback{reason=%s, bucketVersion=%d, remaining=%d}", info.reason, info.bucketVersion, info.remainingRangeCount)
 }
 
 const (
