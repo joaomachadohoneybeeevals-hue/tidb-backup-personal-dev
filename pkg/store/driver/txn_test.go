@@ -292,26 +292,68 @@ func (r lockReq) hasKey(k []byte) bool {
 	return false
 }
 
-// lockReqRecorder records the region routing carried by every pessimistic lock request.
+// routingViolations returns the lock requests for k that the store accepted
+// under a region other than owner at its current epoch.
+func routingViolations(reqs []lockReq, k []byte, owner *metapb.Region) []lockReq {
+	var violations []lockReq
+	for _, r := range reqs {
+		if r.rejected || !r.hasKey(k) {
+			continue
+		}
+		if r.regionID != owner.GetId() || r.epoch.GetVersion() != owner.GetRegionEpoch().GetVersion() {
+			violations = append(violations, r)
+		}
+	}
+	return violations
+}
+
+// lockReqRecorder records the region routing carried by every pessimistic
+// lock request. It looks at pessimistic lock requests only; every other
+// request type passes through untouched.
 type lockReqRecorder struct {
 	tikv.Client
 	mu   sync.Mutex
 	reqs []lockReq
+
+	// When misrouteTo is set, the next pessimistic lock request for
+	// misrouteKey is sent to misrouteTo instead of the region the client chose.
+	misrouteKey  []byte
+	misrouteTo   *metapb.Region
+	misroutePeer *metapb.Peer
 }
 
 func (c *lockReqRecorder) SendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (*tikvrpc.Response, error) {
+	if req.Type != tikvrpc.CmdPessimisticLock {
+		return c.Client.SendRequest(ctx, addr, req, timeout)
+	}
+	r := lockReq{}
+	for _, m := range req.PessimisticLock().Mutations {
+		r.keys = append(r.keys, m.Key)
+	}
+	c.mu.Lock()
+	if c.misrouteTo != nil && r.hasKey(c.misrouteKey) {
+		req.RegionId = c.misrouteTo.GetId()
+		req.RegionEpoch = c.misrouteTo.GetRegionEpoch()
+		req.Peer = c.misroutePeer
+		c.misrouteTo = nil
+	}
+	c.mu.Unlock()
+
 	resp, err := c.Client.SendRequest(ctx, addr, req, timeout)
-	if err == nil && req.Type == tikvrpc.CmdPessimisticLock {
+	if err == nil {
 		regionErr, _ := resp.GetRegionError()
-		r := lockReq{regionID: req.RegionId, epoch: req.RegionEpoch, rejected: regionErr != nil}
-		for _, m := range req.PessimisticLock().Mutations {
-			r.keys = append(r.keys, m.Key)
-		}
+		r.regionID, r.epoch, r.rejected = req.RegionId, req.RegionEpoch, regionErr != nil
 		c.mu.Lock()
 		c.reqs = append(c.reqs, r)
 		c.mu.Unlock()
 	}
 	return resp, err
+}
+
+func (c *lockReqRecorder) misrouteNext(k []byte, region *metapb.Region, peer *metapb.Peer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.misrouteKey, c.misrouteTo, c.misroutePeer = k, region, peer
 }
 
 func (c *lockReqRecorder) take() []lockReq {
@@ -322,85 +364,108 @@ func (c *lockReqRecorder) take() []lockReq {
 	return reqs
 }
 
+// splitLockEnv is a mock store whose only region has been split after the
+// region cache was warmed with the pre-split region.
+type splitLockEnv struct {
+	store   kv.Storage
+	cluster testutils.Cluster
+	rec     *lockReqRecorder
+	// keys holds one key on each side of the split, so whichever half keeps
+	// the old region ID is covered.
+	keys []kv.Key
+	// oldRegionID is the ID of the pre-split region; one half keeps it.
+	oldRegionID uint64
+}
+
+func newSplitLockEnv(t *testing.T, refreshCache bool) *splitLockEnv {
+	env := &splitLockEnv{
+		rec:  &lockReqRecorder{},
+		keys: []kv.Key{kv.Key("a"), kv.Key("z")},
+	}
+	var err error
+	env.store, err = mockstore.NewMockStore(
+		mockstore.WithClusterInspector(func(c testutils.Cluster) {
+			_, _, env.oldRegionID = mockstore.BootstrapWithSingleStore(c)
+			env.cluster = c
+		}),
+		mockstore.WithClientHijacker(func(c tikv.Client) tikv.Client {
+			env.rec.Client = c
+			return env.rec
+		}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, env.store.Close())
+	})
+
+	// Warm the region cache with the pre-split region.
+	for _, k := range env.keys {
+		txn, err := env.lock(t, k, tikvstore.LockAlwaysWait)
+		require.NoError(t, err)
+		require.NoError(t, txn.Rollback())
+	}
+
+	newRegionID, newPeerID := env.cluster.AllocID(), env.cluster.AllocID()
+	env.cluster.Split(env.oldRegionID, newRegionID, []byte("m"), []uint64{newPeerID}, newPeerID)
+
+	if refreshCache {
+		// The region cache already reflects the split when the lock request
+		// is issued.
+		cache := env.store.(interface {
+			GetRegionCache() *tikv.RegionCache
+		}).GetRegionCache()
+		bo := tikv.NewBackofferWithVars(context.Background(), 5000, nil)
+		for _, k := range env.keys {
+			loc, err := cache.LocateKey(bo, k)
+			require.NoError(t, err)
+			cache.InvalidateCachedRegion(loc.Region)
+			_, err = cache.LocateKey(bo, k)
+			require.NoError(t, err)
+		}
+	}
+	env.rec.take()
+	return env
+}
+
+func (env *splitLockEnv) lock(t *testing.T, k kv.Key, waitTime int64) (kv.Transaction, error) {
+	txn, err := env.store.Begin()
+	require.NoError(t, err)
+	txn.SetOption(kv.Pessimistic, true)
+	lockCtx := tikvstore.NewLockCtx(txn.StartTS(), waitTime, time.Now())
+	if err := txn.LockKeys(context.Background(), lockCtx, k); err != nil {
+		require.NoError(t, txn.Rollback())
+		return nil, err
+	}
+	return txn, nil
+}
+
+// owner returns the region that owns k according to the mock cluster.
+func (env *splitLockEnv) owner(t *testing.T, k kv.Key) (*metapb.Region, *metapb.Peer) {
+	region, peer, _, _ := env.cluster.GetRegionByKey(codec.EncodeBytes(nil, k))
+	require.NotNil(t, region)
+	return region, peer
+}
+
 // TestPessimisticLockAcrossSplit guards the routing invariant documented on
 // tikvTxn.LockKeys: a pessimistic lock on a key whose region has just changed
 // must be acquired on the region that owns the key now.
 func TestPessimisticLockAcrossSplit(t *testing.T) {
 	for _, refreshCache := range []bool{false, true} {
 		t.Run(fmt.Sprintf("refreshCache=%v", refreshCache), func(t *testing.T) {
-			var cluster testutils.Cluster
-			var regionID uint64
-			rec := &lockReqRecorder{}
-			store, err := mockstore.NewMockStore(
-				mockstore.WithClusterInspector(func(c testutils.Cluster) {
-					_, _, regionID = mockstore.BootstrapWithSingleStore(c)
-					cluster = c
-				}),
-				mockstore.WithClientHijacker(func(c tikv.Client) tikv.Client {
-					rec.Client = c
-					return rec
-				}),
-			)
-			require.NoError(t, err)
-			defer func() {
-				require.NoError(t, store.Close())
-			}()
-
-			ctx := context.Background()
-			lock := func(k kv.Key, waitTime int64) (kv.Transaction, error) {
-				txn, err := store.Begin()
-				require.NoError(t, err)
-				txn.SetOption(kv.Pessimistic, true)
-				lockCtx := tikvstore.NewLockCtx(txn.StartTS(), waitTime, time.Now())
-				if err := txn.LockKeys(ctx, lockCtx, k); err != nil {
-					require.NoError(t, txn.Rollback())
-					return nil, err
-				}
-				return txn, nil
-			}
-
-			// One key on each side of the split, so whichever half keeps the
-			// old region ID is covered.
-			keys := []kv.Key{kv.Key("a"), kv.Key("z")}
-
-			// Warm the region cache with the pre-split region.
-			for _, k := range keys {
-				txn, err := lock(k, tikvstore.LockAlwaysWait)
-				require.NoError(t, err)
-				require.NoError(t, txn.Rollback())
-			}
-
-			newRegionID, newPeerID := cluster.AllocID(), cluster.AllocID()
-			cluster.Split(regionID, newRegionID, []byte("m"), []uint64{newPeerID}, newPeerID)
-
-			if refreshCache {
-				// The region cache already reflects the split when the lock
-				// request is issued.
-				cache := store.(interface {
-					GetRegionCache() *tikv.RegionCache
-				}).GetRegionCache()
-				bo := tikv.NewBackofferWithVars(ctx, 5000, nil)
-				for _, k := range keys {
-					loc, err := cache.LocateKey(bo, k)
-					require.NoError(t, err)
-					cache.InvalidateCachedRegion(loc.Region)
-					_, err = cache.LocateKey(bo, k)
-					require.NoError(t, err)
-				}
-			}
-			rec.take()
+			env := newSplitLockEnv(t, refreshCache)
 
 			sawRejection := false
-			for _, k := range keys {
-				holder, err := lock(k, tikvstore.LockAlwaysWait)
+			for _, k := range env.keys {
+				holder, err := env.lock(t, k, tikvstore.LockAlwaysWait)
 				require.NoError(t, err)
 
 				// Every request the store accepted must name the region that
 				// owns the key now, at its current epoch.
-				owner, _, _, _ := cluster.GetRegionByKey(codec.EncodeBytes(nil, k))
-				require.NotNil(t, owner)
+				owner, _ := env.owner(t, k)
+				reqs := env.rec.take()
+				require.Empty(t, routingViolations(reqs, k, owner))
 				accepted := 0
-				for _, r := range rec.take() {
+				for _, r := range reqs {
 					if !r.hasKey(k) {
 						continue
 					}
@@ -409,17 +474,15 @@ func TestPessimisticLockAcrossSplit(t *testing.T) {
 						continue
 					}
 					accepted++
-					require.Equal(t, owner.GetId(), r.regionID)
-					require.Equal(t, owner.GetRegionEpoch().GetVersion(), r.epoch.GetVersion())
 				}
 				require.Equal(t, 1, accepted)
 
 				// The lock is visible where other transactions look for it.
-				_, err = lock(k, tikvstore.LockNoWait)
+				_, err = env.lock(t, k, tikvstore.LockNoWait)
 				require.True(t, derr.ErrLockAcquireFailAndNoWaitSet.Equal(err), "unexpected error: %v", err)
 
 				require.NoError(t, holder.Rollback())
-				other, err := lock(k, tikvstore.LockNoWait)
+				other, err := env.lock(t, k, tikvstore.LockNoWait)
 				require.NoError(t, err)
 				require.NoError(t, other.Rollback())
 			}
@@ -429,4 +492,41 @@ func TestPessimisticLockAcrossSplit(t *testing.T) {
 			}
 		})
 	}
+
+	// Negative control: prove the routing check above fails when a lock is
+	// accepted under the stale region. The client routes correctly here, so
+	// the misroute is injected at the RPC layer.
+	t.Run("misroutedLockIsDetected", func(t *testing.T) {
+		env := newSplitLockEnv(t, true)
+
+		// One half of the split keeps the old region ID. Take the key that
+		// moved to the new region, and the region that kept the old ID.
+		var (
+			moved        kv.Key
+			owner, stale *metapb.Region
+			stalePeer    *metapb.Peer
+		)
+		for _, k := range env.keys {
+			region, peer := env.owner(t, k)
+			if region.GetId() == env.oldRegionID {
+				stale, stalePeer = region, peer
+			} else {
+				moved, owner = k, region
+			}
+		}
+		require.NotNil(t, stale)
+		require.NotNil(t, owner)
+
+		// Send the lock for the moved key to the old region at that region's
+		// current epoch, so the store's epoch check cannot reject it.
+		env.rec.misrouteNext(moved, stale, stalePeer)
+		holder, err := env.lock(t, moved, tikvstore.LockAlwaysWait)
+		require.NoError(t, err)
+
+		violations := routingViolations(env.rec.take(), moved, owner)
+		require.Len(t, violations, 1, "the routing check must flag a lock accepted under the old region")
+		require.Equal(t, stale.GetId(), violations[0].regionID)
+
+		require.NoError(t, holder.Rollback())
+	})
 }
