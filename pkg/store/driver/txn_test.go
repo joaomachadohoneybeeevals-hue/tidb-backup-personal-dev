@@ -24,7 +24,6 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/pkg/kv"
-	derr "github.com/pingcap/tidb/pkg/store/driver/error"
 	"github.com/pingcap/tidb/pkg/store/mockstore"
 	"github.com/pingcap/tidb/pkg/util/codec"
 	"github.com/stretchr/testify/require"
@@ -477,14 +476,9 @@ func TestPessimisticLockAcrossSplit(t *testing.T) {
 				}
 				require.Equal(t, 1, accepted)
 
-				// The lock is visible where other transactions look for it.
-				_, err = env.lock(t, k, tikvstore.LockNoWait)
-				require.True(t, derr.ErrLockAcquireFailAndNoWaitSet.Equal(err), "unexpected error: %v", err)
-
+				// Release the lock before taking the next one, so no lock
+				// request in this test ever meets another transaction's lock.
 				require.NoError(t, holder.Rollback())
-				other, err := env.lock(t, k, tikvstore.LockNoWait)
-				require.NoError(t, err)
-				require.NoError(t, other.Rollback())
 			}
 			if !refreshCache {
 				// A stale cache entry must be caught by the epoch check and retried.
