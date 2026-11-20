@@ -86,6 +86,19 @@ func (txn *tikvTxn) CacheTableInfo(id int64, info *model.TableInfo) {
 	}
 }
 
+// LockKeys acquires pessimistic locks on the given keys.
+//
+// Region-routing invariant: this layer must not hold its own idea of which
+// region owns a key. Routing for a lock request is derived from the region
+// cache by client-go when the request is grouped, and travels with the batch
+// as a RegionVerID (region ID plus epoch), so a split that lands before the
+// send is caught as an epoch mismatch and the keys are located again.
+//
+// Anything added on this path that remembers a region for a key (a lookup by
+// bare region ID, a routing hint that outlives one LockKeys call) must carry
+// the epoch and be revalidated against the region cache before sending.
+// Otherwise the lock can be written under a region that no longer owns the
+// key, leaving the key unlocked where other transactions look for it.
 func (txn *tikvTxn) LockKeys(ctx context.Context, lockCtx *kv.LockCtx, keysInput ...kv.Key) error {
 	if intest.InTest {
 		txn.isCommitterWorking.Store(true)
